@@ -5,6 +5,7 @@ import { isLoggedIn } from './auth.mjs';
 import { fetchModels } from './upstream.mjs';
 import { learnLimit } from './compress.mjs';
 import { usableCount } from './pool.mjs';
+import { warn } from './log.mjs';
 
 const TTL_OK = 5 * 60 * 1000;
 const TTL_ERR = 60 * 1000;
@@ -194,15 +195,62 @@ async function computeFallback(cfg, 首选站点, 目标模型) {
 }
 
 /**
+ * 从候选里挑一个「还有可用账号」的站点；一个都没有时返回 null。
+ *
+ * 抽成纯函数是为了能单测 —— 真正的候选收集要访问上游目录，单测里拿不到。
+ */
+export function pickSiteWithAccounts(candidates, defaultSite) {
+  const 可用 = candidates.filter((c) => c.usable);
+  return 可用.length ? rankSiteCandidates(可用, defaultSite)[0].site : null;
+}
+
+/**
+ * 额度感知改派：模型被「钉」在某个站点（显式前缀 / 别名 / 路由表），
+ * 但那个站点现在一个可用账号都没有时，直接改派到另一个「有可用账号且确实提供该模型」的站点。
+ *
+ * 为什么不等请求打完再降级：
+ *   - 那个站点必然失败（不是 429 就是 403），白白多付一次往返与一段报错日志；
+ *   - 有些站点级拒绝根本不触发降级。实测：账号被风控后上游回 403「request illegal」，
+ *     它既不是网关错误也不是额度错误，四条降级路径一条都不匹配，请求就直接失败了。
+ *
+ * 边界（保持保守，不改变既有行为）：
+ *   - 首选站点只要还有**任意一个**可用账号，就原样返回 null，完全不介入；
+ *   - 所有候选站点都没有可用账号时同样返回 null，照旧发出去试一次
+ *     （额度可能已经重置，本地直接放弃反而更差）。
+ */
+async function 改派到有额度的站点(cfg, 站点, 模型) {
+  if (有可用账号(站点)) return null;
+  const 备选 = [];
+  for (const s of siteKeys(cfg)) {
+    if (s === 站点) continue;
+    const cat = await getCatalog(cfg, s);
+    const info = cat.models.get(模型);
+    if (info) 备选.push({ site: s, mult: parseMultiplier(info.credits), usable: 有可用账号(s) });
+  }
+  return pickSiteWithAccounts(备选, cfg.defaultSite);
+}
+
+/**
  * 解析请求里的模型 → { site, model, requested, fallback? }。
  *
- * 外层包一层「确保目标站点的目录已加载」：目录里带 maxInputTokens，
- * 加载时会登记进压缩模块的上限表。少了这一步，走显式前缀（`cn-cli/xxx`）
- * 的请求可能整条路径都不碰目录，压缩就因为没有上限而完全不触发
- * —— 表现为长上下文照样吃 400。
+ * 外层做两件事：
+ *   1) 额度感知改派（见 改派到有额度的站点）
+ *   2) 确保目标站点的目录已加载 —— 目录里带 maxInputTokens，加载时会登记进压缩模块的
+ *      上限表。少了这一步，走显式前缀（`cn-cli/xxx`）的请求可能整条路径都不碰目录，
+ *      压缩就因为没有上限而完全不触发，表现为长上下文照样吃 400。
  */
 export async function resolveTarget(cfg, requestedModel) {
-  const target = await resolveTargetInner(cfg, requestedModel);
+  let target = await resolveTargetInner(cfg, requestedModel);
+
+  const 改派站点 = await 改派到有额度的站点(cfg, target.site, target.model);
+  if (改派站点) {
+    warn(
+      `[${target.site}] 该站点当前没有可用账号，直接改派到 ${改派站点}（模型 ${target.model}）`
+      + `，不再先撞一次失败`,
+    );
+    target = { ...target, site: 改派站点, fallback: await computeFallback(cfg, 改派站点, target.model) };
+  }
+
   try {
     await getCatalog(cfg, target.site);
   } catch {

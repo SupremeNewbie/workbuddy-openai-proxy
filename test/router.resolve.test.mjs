@@ -5,7 +5,7 @@
 // 已抽成纯函数 rankSiteCandidates，在文件末尾单独覆盖。
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
-import { resolveTarget, rankSiteCandidates } from '../src/router.mjs';
+import { resolveTarget, rankSiteCandidates, pickSiteWithAccounts } from '../src/router.mjs';
 
 function mkCfg(over = {}) {
   return {
@@ -251,5 +251,35 @@ describe('rankSiteCandidates：选站排序（降级目标与目录匹配共用�
 
   test('空候选返回空数组', () => {
     assert.deepEqual(rankSiteCandidates([], 'a'), []);
+  });
+});
+
+describe('pickSiteWithAccounts：额度感知改派', () => {
+  const 候选 = (...xs) => xs.map(([site, usable, mult]) => ({ site, usable, mult }));
+
+  test('首选站点没额度时，改派到有可用账号的站点', () => {
+    // 回归：账号被风控后上游回 403「request illegal」，
+    // 它既不是网关错误也不是额度错误，四条降级路径一条都不匹配，
+    // 请求直接失败。改派发生在请求之前，因此不受错误类型影响。
+    assert.equal(pickSiteWithAccounts(候选(['cn-cli', true, 0.8], ['intl-work', false, 1]), 'cn-cli'), 'cn-cli');
+  });
+
+  test('多个候选都有可用账号时，按倍率选最低的', () => {
+    const r = pickSiteWithAccounts(候选(['a', true, 1.5], ['b', true, 0.7]), 'a');
+    assert.equal(r, 'b');
+  });
+
+  test('倍率相同时偏向 defaultSite', () => {
+    assert.equal(pickSiteWithAccounts(候选(['other', true, 1], ['home', true, 1]), 'home'), 'home');
+  });
+
+  test('一个可用账号都没有时返回 null（不改派，照旧发出去试一次）', () => {
+    // 这条边界必须守住：全站都没额度时本地直接放弃，比发一次请求更差
+    // ——额度可能已经重置了。
+    assert.equal(pickSiteWithAccounts(候选(['a', false, 1], ['b', false, 2]), 'a'), null);
+  });
+
+  test('空候选返回 null', () => {
+    assert.equal(pickSiteWithAccounts([], 'a'), null);
   });
 });
