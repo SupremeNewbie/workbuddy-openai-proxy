@@ -115,8 +115,21 @@ export const SITE_PRESETS = {
     origin: 'https://www.workbuddy.ai',
     userAgent: 'CLI/2.63.2 CodeBuddy/2.63.2',
     product: 'SaaS',
-    // 登录后可自行补充实测可用的模型 ID
-    seedModels: [{ id: 'auto', name: 'Auto（上游自动路由）' }],
+    // 这个站点拉不到动态目录（catalog_source 恒为 seed），所以内置清单就是它的全部目录。
+    // 只放 `auto` 会踩两个坑：
+    //   1) 配了 allowModels（如只留 glm-* / deepseek-v4*）时 auto 被过滤掉 → 目录变成 0 个模型，
+    //      裸模型名既选不中它、它也不会被选为降级目标；
+    //   2) 没有 contextWindow → 压缩模块拿不到上限 → 预压缩完全不生效，
+    //      每个长请求都要先撞一次 400 再重试，白等 20~30 秒。
+    // 下面是实测可用的清单（上限来自上游报的 "… > 1048576 maximum"）。
+    seedModels: [
+      { id: 'auto', name: 'Auto（上游自动路由）' },
+      { id: 'deepseek-v4.1-flash', name: 'DeepSeek-V4.1-Flash', contextWindow: 1048576 },
+      { id: 'deepseek-v4-pro', name: 'DeepSeek-V4-Pro', contextWindow: 1048576 },
+      { id: 'glm-5.3', name: 'GLM-5.3', contextWindow: 1048576 },
+      { id: 'glm-5.2', name: 'GLM-5.2', contextWindow: 1048576 },
+      { id: 'glm-5.3-flash', name: 'GLM-5.3-Flash', contextWindow: 1048576 },
+    ],
   },
 };
 
