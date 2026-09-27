@@ -21,6 +21,10 @@ const {
   resetLearnedLimits,
   estimateMessages,
   estimateTokensAccurate,
+  parseActualTokens,
+  calibrateEstimate,
+  calibrationFactor,
+  isProviderParamRejection,
 } = await import('../src/compress.mjs');
 
 const 填充 = (n) => '啊'.repeat(n);
@@ -279,5 +283,120 @@ describe('truncateMessage', () => {
     const 原 = m.content;
     truncateMessage(m, 50);
     assert.equal(m.content, 原, '应返回副本，不能就地改');
+  });
+});
+
+// 上游对「输入远超上限」有两种报法：
+//   11115 → "prompt is too long: N tokens > M maximum"（带数字，能解析）
+//   11133 → "Invalid request parameters" + extError model_param_invalid（一句通用文案）
+// 只认前者会让后者完全不触发压缩，请求硬失败（实测 250 万字符触发，100 万字符仍是 200）。
+describe('上游报错解析：真实 token 数与「参数被供应商拒」', () => {
+  test('parseActualTokens 能解析被转义的 >', () => {
+    // 上游 JSON 里 > 是 \u003e，不还原就匹配不到（parseLimitFromError 踩过同一个坑）
+    const text = '{"code":11115,"msg":"prompt is too long: 1193121 tokens \\u003e 1048576 maximum"}';
+    assert.equal(parseActualTokens(text), 1193121);
+  });
+
+  test('parseActualTokens 对不带数字的报错返回 null', () => {
+    assert.equal(parseActualTokens('{"code":11133,"msg":"Invalid request parameters"}'), null);
+    assert.equal(parseActualTokens(''), null);
+  });
+
+  test('isProviderParamRejection 认出 11133 + model_param_invalid', () => {
+    const text = '{"code":11133,"msg":"Invalid request parameters","extError":{"code":"model_param_invalid"}}';
+    assert.equal(isProviderParamRejection(text), true);
+  });
+
+  test('isProviderParamRejection 不误伤其它 400', () => {
+    assert.equal(
+      isProviderParamRejection('{"code":11101,"msg":"Non-stream chat request is currently not supported"}'),
+      false,
+    );
+    assert.equal(isProviderParamRejection('{"code":11128,"msg":"first message is not system prompt"}'), false);
+    // 只有 11133、但 extError 不是 model_param_invalid 时也不算
+    assert.equal(isProviderParamRejection('{"code":11133,"msg":"something else"}'), false);
+  });
+
+  test('isTooLongError 对 11133 仍返回 false（算不算超限由上游层带守卫判断）', () => {
+    const text = '{"code":11133,"msg":"Invalid request parameters","extError":{"code":"model_param_invalid"}}';
+    assert.equal(isTooLongError(400, text), false);
+  });
+});
+
+describe('估算校准：用上游报的真实 token 数修正本地低估', () => {
+  test('没校准过的模型倍率为 1（不改动原有行为）', () => {
+    assert.equal(calibrationFactor('intl-work', 'deepseek-v4.1-flash'), 1);
+  });
+
+  test('按「真实 ÷ 本地估算」的比值校准', () => {
+    // 实测样本：上游报 1,193,121，本地只估到 620,249
+    const f = calibrateEstimate('intl-work', 'deepseek-v4.1-flash', 1193121, 620249);
+    assert.ok(f > 1.9 && f < 1.95, `倍率应约 1.92，实际 ${f}`);
+    assert.equal(calibrationFactor('intl-work', 'deepseek-v4.1-flash'), f);
+  });
+
+  test('倍率夹在 [1,4]：只修低估，也不被单次异常样本带飞', () => {
+    assert.equal(calibrateEstimate('s', 'm1', 500, 1000), 1, '估高了的样本夹到 1');
+    assert.equal(calibrateEstimate('s', 'm2', 1000000, 1000), 4, '极端样本夹到 4');
+  });
+
+  test('多次样本按指数滑动平均收敛', () => {
+    assert.equal(calibrateEstimate('s', 'm3', 200, 100), 2);
+    assert.equal(calibrateEstimate('s', 'm3', 200, 100), 2, '同样本不应漂移');
+    assert.equal(calibrateEstimate('s', 'm3', 400, 100), 3, '0.5×2.0 + 0.5×4.0');
+  });
+
+  test('无效样本返回 null 且不写入', () => {
+    assert.equal(calibrateEstimate('s', 'm4', 0, 100), null);
+    assert.equal(calibrateEstimate('s', 'm4', 100, 0), null);
+    assert.equal(calibrateEstimate('s', 'm4', NaN, 100), null);
+    assert.equal(calibrationFactor('s', 'm4'), 1);
+  });
+
+  test('resetLearnedLimits 同时清空校准', () => {
+    calibrateEstimate('s', 'm5', 200, 100);
+    assert.equal(calibrationFactor('s', 'm5'), 2);
+    resetLearnedLimits();
+    assert.equal(calibrationFactor('s', 'm5'), 1);
+  });
+
+  test('校准按 站点/模型 隔离', () => {
+    calibrateEstimate('a', 'm', 200, 100);
+    assert.equal(calibrationFactor('a', 'm'), 2);
+    assert.equal(calibrationFactor('b', 'm'), 1);
+    assert.equal(calibrationFactor('a', 'other'), 1);
+  });
+});
+
+describe('fitMessages：截断量纲与 applied 语义（回归）', () => {
+  test('单条消息自身超限时会被真的截断', () => {
+    // 回归：这一步曾用粗略的 estimateTokens（约 0.333 token/字符）去和按
+    // tokenWeight（中文约 0.55 token/字符）算出的「每条预算」比较 —— 两者量纲不同，
+    // 于是该截断时不截断。日志表现是「已自动压缩：丢弃 0 条、截断 0 条，A → A」，
+    // 请求照样超限发出，白撞一次上游 400。
+    const msgs = [{ role: 'system', content: 'sys' }, { role: 'user', content: 填充(1_000_000) }];
+    const { messages, stats } = fitMessages(msgs, {
+      maxInputTokens: 500_000,
+      reserveForOutput: 0,
+      safetyRatio: 1,
+    });
+    assert.equal(stats.truncated, 1, '应截断那条超大消息');
+    assert.ok(stats.after < stats.before, `应真的变小：${stats.before} → ${stats.after}`);
+    assert.equal(stats.applied, true);
+    assert.ok(messages[1].content.includes('被代理截断'));
+  });
+
+  test('压不动时 applied 为 false（不能报「已压缩」却没变）', () => {
+    // 语义是「确实压小了」，不是「超了预算」：
+    // 上游重试靠它判断「还压得动吗」，applyContextFit 靠它决定要不要打日志。
+    // 多模态数组的内容不是字符串，截断不动 —— 此时必须如实返回 applied=false。
+    const msgs = [
+      { role: 'system', content: 'sys' },
+      { role: 'user', content: [{ type: 'text', text: 填充(1_000_000) }] },
+    ];
+    const { stats } = fitMessages(msgs, { maxInputTokens: 500_000, reserveForOutput: 0, safetyRatio: 1 });
+    assert.equal(stats.applied, false);
+    assert.equal(stats.truncated, 0, '压不动就不该计入 truncated');
+    assert.equal(stats.after, stats.before);
   });
 });

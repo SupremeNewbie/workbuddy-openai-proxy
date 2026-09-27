@@ -5,7 +5,16 @@
 import crypto from 'node:crypto';
 import { getAuth, ensureToken } from './auth.mjs';
 import { markSuccess, markFailure, isQuotaError, usableCount } from './pool.mjs';
-import { fitMessages, estimateMessages, learnedLimit, isTooLongError } from './compress.mjs';
+import {
+  fitMessages,
+  estimateMessages,
+  learnedLimit,
+  isTooLongError,
+  isProviderParamRejection,
+  calibrationFactor,
+  calibrateEstimate,
+  parseActualTokens,
+} from './compress.mjs';
 import { chatHeaders, billingHeaders } from './headers.mjs';
 import { warn } from './log.mjs';
 
@@ -118,8 +127,13 @@ export function applyContextFit(cfg, body, { site = null, limitOverride = null }
   const limit = limitOverride || (site ? learnedLimit(site, model) : null);
   if (!Number.isFinite(limit) || limit <= 0) return null; // 不知道上限就先原样发，撞墙后再学
 
+  // 预算拿的是**本地估算值**，而估算器对混合长文本会低估（实测差 1.92 倍）。
+  // 把上限按实测倍率折回去，才能让「估算 ≤ 折算上限」等价于「真实 ≤ 上限」，
+  // 否则预压缩看着压够了、发出去照样超限，每个请求先白撞一次 400。
+  const 折算上限 = site ? Math.floor(limit / calibrationFactor(site, model)) : limit;
+
   const { messages, stats } = fitMessages(body.messages, {
-    maxInputTokens: limit,
+    maxInputTokens: 折算上限,
     reserveForOutput: Number(body.max_tokens) || conf.reserveForOutput || 4096,
     minKeepMessages: conf.minKeepMessages ?? 4,
     safetyRatio: conf.safetyRatio ?? 0.95,
@@ -251,11 +265,25 @@ export async function openChat(cfg, site, body, { signal, exclude = [], accountI
     // 只在「输入太长」且还有机会压缩时重试
     if (res.status < 400 || 压缩重试次数 >= 最大压缩重试) break;
     const text = await res.text().catch(() => '');
-    if (!isTooLongError(res.status, text)) {
+    // 这两个值要在判断之前算出来：下面判断 11133 算不算「超限」时要用到。
+    const 已知上限 = learnedLimit(site, model);
+    const 当前估计 = estimateMessages(当前payload.messages);
+    // 供应商侧把「输入远超上限」也报成 400 + 11133 model_param_invalid（没有 token 数字），
+    // 任何「too long」关键词都匹配不到，压缩逻辑完全不触发 —— 请求硬失败。
+    // 这个码同样可能来自「别的参数非法」，所以加一道守卫：
+    // 只有在「已知上限无法证明当前体积合规」时才把它当超限处理。
+    const 可能是超限 =
+      isProviderParamRejection(text) && (已知上限 === null || 当前估计 * calibrationFactor(site, model) > 已知上限);
+    if (!isTooLongError(res.status, text) && !可能是超限) {
       // 不是「太长」，把读掉的 body 还原成一个可返回的结果
       res = { status: res.status, _text: text };
       break;
     }
+
+    // 上游亲口报的真实 token 数是最可靠的样本，据此校准本地估算器
+    // （本地对混合长文本会低估，不校准的话「压到目标」其实仍然超限）。
+    const 真实tokens = parseActualTokens(text);
+    if (真实tokens !== null) calibrateEstimate(site, model, 真实tokens, 当前估计);
 
     // 上游报的「too long: N > M maximum」里的数字**不可信**，实测：
     //   glm-5.1 报 "100001 tokens > 100000 maximum"，但同一模型
@@ -263,11 +291,11 @@ export async function openChat(cfg, site, body, { signal, exclude = [], accountI
     //   真正触发 400 的是请求体积（约 34~40 万字符），报错信息是误导性的。
     //   所以这里不把它当成模型的真实上限，只当「这次发太大了」的信号，
     //   用「相对收缩 + 重试」逐步逼近，而不是一步跳到那个数字。
-    const 已知上限 = learnedLimit(site, model);
-    const 当前估计 = estimateMessages(当前payload.messages);
     const 收缩比 = 压缩重试次数 === 0 ? 0.75 : 0.5;
-    // 已知上限比当前还小时直接按它压，否则按比例收缩
-    const 预算 = Math.min(已知上限 ?? Number.POSITIVE_INFINITY, Math.floor(当前估计 * 收缩比));
+    // 已知上限比当前还小时直接按它压，否则按比例收缩；上限同样要按校准倍率折算
+    const 折算上限 =
+      已知上限 === null ? Number.POSITIVE_INFINITY : Math.floor(已知上限 / calibrationFactor(site, model));
+    const 预算 = Math.min(折算上限, Math.floor(当前估计 * 收缩比));
 
     const 更小 = fitMessages(Array.isArray(当前payload.messages) ? 当前payload.messages : [], {
       maxInputTokens: 预算,

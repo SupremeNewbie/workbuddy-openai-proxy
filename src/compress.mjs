@@ -11,7 +11,6 @@
 //   2. system 提示词永远保留（丢了会改变行为）。
 //   3. 越新的消息越重要，所以从最老的开始丢。
 //   4. 单条消息本身就超限时，只能截断它自己的内容（保留头尾）。
-import { estimateTokens } from './util.mjs';
 
 /** 上游报「太长」时的真实上限缓存：`site/model` → maxInputTokens。 */
 const learnedLimits = new Map();
@@ -102,9 +101,63 @@ export function learnedLimit(site, model) {
   return learnedLimits.get(`${site}/${model}`)?.value ?? null;
 }
 
-/** 清空学习到的上限（测试用）。 */
+/**
+ * 估算偏差的实测修正：`site/model` → 倍率（上游报的真实 tokens ÷ 本地估算）。
+ *
+ * 为什么需要：本地按字符类型加权估算（中文 0.55 / 英文 0.25 / 数字 0.33），
+ * 对长会话里的 JSON、工具调用、代码混合文本会严重**低估**。实测一次真实
+ * 1,193,121 tokens 的请求，本地只估到 620,249 —— 差 1.92 倍。
+ * 后果：预压缩「压到 95% 上限」其实仍然超限，每个请求都要先撞一次 400 再重试，
+ * 白等 20~30 秒。这里用上游亲口报的数字把这个倍率学出来。
+ */
+const estimateCalibration = new Map();
+
+/**
+ * 从上游 400 报错里解析**真实** token 数，
+ * 例如 "prompt is too long: 1193121 tokens > 1048576 maximum"。
+ * 同样要先还原被转义的 `>`（与 parseLimitFromError 同一个坑）。
+ */
+export function parseActualTokens(text) {
+  const s = String(text || '').replace(/\\u003[ce]/gi, (m) => (m.toLowerCase().endsWith('e') ? '>' : '<'));
+  const m = s.match(/(\d+)\s*tokens?\s*>\s*(\d+)/i);
+  return m ? Number(m[1]) : null;
+}
+
+/**
+ * 用上游报的真实 token 数校准本地估算器。返回新倍率；样本不可用返回 null。
+ * 倍率夹在 [1, 4]：只修「低估」，也避免单次异常样本把预算压得过狠。
+ */
+export function calibrateEstimate(site, model, 真实, 本地估算) {
+  if (!Number.isFinite(真实) || !Number.isFinite(本地估算) || 真实 <= 0 || 本地估算 <= 0) return null;
+  const 样本 = Math.min(4, Math.max(1, 真实 / 本地估算));
+  const key = `${site}/${model}`;
+  const prev = estimateCalibration.get(key);
+  // 指数滑动平均：单次样本不带偏整体，又能较快收敛
+  const 新 = prev ? prev * 0.5 + 样本 * 0.5 : 样本;
+  estimateCalibration.set(key, 新);
+  return 新;
+}
+
+/** 取该模型的估算修正倍率；没校准过就是 1（不改动原有行为）。 */
+export function calibrationFactor(site, model) {
+  return (site && estimateCalibration.get(`${site}/${model}`)) || 1;
+}
+
+/**
+ * 上游把「输入远超上限」也报成 400 + `11133 model_param_invalid`，
+ * 而不是那条带 token 数字的 `11115 prompt is too long`。
+ * 后者能被 isTooLongError 匹配，前者只有一句通用文案，一个关键词都不匹配
+ * —— 压缩逻辑完全不走，请求直接失败（实测 250 万字符触发，100 万字符仍是 200）。
+ */
+export function isProviderParamRejection(text) {
+  const s = String(text || '');
+  return /"code"\s*:\s*11133\b/.test(s) && /model_param_invalid/.test(s);
+}
+
+/** 清空学习到的上限与估算校准（测试用）。 */
 export function resetLearnedLimits() {
   learnedLimits.clear();
+  estimateCalibration.clear();
 }
 
 /**
@@ -198,8 +251,6 @@ export function fitMessages(messages, {
     return { messages: list, stats };
   }
 
-  stats.applied = true;
-
   // 1) 开头连续的 system 消息视为「系统提示」，不可丢
   let sysEnd = 0;
   while (sysEnd < list.length && String(list[sysEnd]?.role || '').toLowerCase() === 'system') sysEnd++;
@@ -225,14 +276,25 @@ export function fitMessages(messages, {
     const 可分配 = Math.max(512, 预算 - 系统token);
     const 每条预算 = Math.max(256, Math.floor(可分配 / Math.max(1, 当前.length - 系统块.length)));
     for (let i = 系统块.length; i < 当前.length; i++) {
-      const before = estimateTokens(JSON.stringify(当前[i]));
+      // 必须和预算用同一个口径（tokenWeight 的中文感知估算）。
+      // 这里曾经用粗略的 estimateTokens（3 字符≈1 token），与按 0.55/字符
+      // 算出的「每条预算」不同量纲，于是该截断时不截断
+      // （日志表现为「已自动压缩：丢弃 0 条、截断 0 条，A → A」，请求照样超限发出）。
+      const before = estimateTokensAccurate(当前[i]);
       if (before <= 每条预算) continue;
-      当前[i] = truncateMessage(当前[i], 每条预算);
+      const 截断后 = truncateMessage(当前[i], 每条预算);
+      // 内容不是字符串（多模态数组）等情况压不动，别把它算进 truncated
+      if (截断后.content === 当前[i].content) continue;
+      当前[i] = 截断后;
       当前[i]._proxy_truncated = true;
       stats.truncated++;
     }
   }
 
   stats.after = estimateMessages(当前);
+  // 只有真的变小了才算「压缩生效」，而不是「超过了预算」：
+  //   - applyContextFit 据此决定要不要打日志，否则会打出「已压缩：A → A」这种误导行
+  //   - 上游重试据此判断「还压得动吗」，没变小就该停下，而不是白重试一轮
+  stats.applied = stats.after < stats.before;
   return { messages: 当前, stats };
 }
