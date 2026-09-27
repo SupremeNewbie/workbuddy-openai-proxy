@@ -443,6 +443,33 @@ const TOKEN = window.__WB_TOKEN__ || '';
 const $ = (id) => document.getElementById(id);
 const esc = (s) => String(s ?? '').replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
 
+/**
+ * 控制台会话失效的处理。
+ *
+ * 服务每次启动都会随机生成一个新的会话 token，而页面里内联的是「打开那一刻」的旧值。
+ * 不做处理的话，页面会每 2 秒轮询失败一次、服务端跟着刷出成千上万条「鉴权失败」，
+ * 而用户只看到一片红字，并不知道只要按一下 F5。
+ */
+let 会话失效处理中 = false;
+function 处理会话失效(消息) {
+  if (会话失效处理中) return;
+  会话失效处理中 = true;
+  // 时间锁必须放 sessionStorage：location.reload() 之后模块变量会重置，
+  // 只有它能拦住「服务异常时无限刷新」。
+  let 上次 = 0;
+  try { 上次 = Number(sessionStorage.getItem('wb-console-reload-at') || 0); } catch { /* 隐私模式忽略 */ }
+  if (Date.now() - 上次 < 15000) return;
+  try { sessionStorage.setItem('wb-console-reload-at', String(Date.now())); } catch { /* 同上 */ }
+
+  const tip = document.createElement('div');
+  tip.textContent = 消息 + '，正在自动刷新…';
+  tip.style.cssText = 'position:fixed;left:0;right:0;top:0;z-index:99999;padding:10px 16px;'
+    + 'background:#b45309;color:#fff;font:14px/1.5 system-ui,sans-serif;text-align:center;'
+    + 'box-shadow:0 2px 10px rgba(0,0,0,.35)';
+  document.body.appendChild(tip);
+  setTimeout(() => location.reload(), 1200);
+}
+
 async function api(path, opts = {}) {
   const res = await fetch('/console/api' + path, {
     ...opts,
@@ -453,9 +480,18 @@ async function api(path, opts = {}) {
   let json = null;
   try { json = JSON.parse(text); } catch { json = { raw: text }; }
   if (!res.ok) {
-    const err = new Error(json.error || ('HTTP ' + res.status));
-    // 把后端标记（如 need_token）带到 Error 上，便于调用方分支处理
-    if (json.need_token) err.needToken = true;
+    // 服务端有两套错误信封：控制台接口用 { error: '文本' }，
+    // 顶层 sendError 用 { error: { message, type, code } }。
+    // 只认字符串会把 401 的提示变成 "[object Object]"，也认不出会话失效标记。
+    const info = json.error;
+    const msg = typeof info === 'string' ? info : (info && info.message) || ('HTTP ' + res.status);
+    const type = info && typeof info === 'object' ? info.type : null;
+    const err = new Error(msg);
+    // 把后端标记（如 need_token / invalid_console_token）带到 Error 上，便于调用方分支处理
+    if (json.need_token || type === 'invalid_console_token') {
+      err.needToken = true;
+      处理会话失效(msg);
+    }
     if (json.hint) err.hint = json.hint;
     throw err;
   }
