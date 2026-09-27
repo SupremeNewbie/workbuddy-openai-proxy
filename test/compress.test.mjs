@@ -400,3 +400,26 @@ describe('fitMessages：截断量纲与 applied 语义（回归）', () => {
     assert.equal(stats.after, stats.before);
   });
 });
+
+describe('token 估算：标点/符号的权重（回归）', () => {
+  test('标点比字母更贵', () => {
+    // 回归：标点原先和字母一样按 0.25 算，而分词器基本一个标点一个 token。
+    // 后果是 JSON / 代码密集的内容被系统性低估 —— 实测一个 tools JSON
+    // 本地估 928,990、上游真实约 998,920，低估 7.5%，直接导致长请求被判「装得下」
+    // 却在上游吃 400。按实测反推，标点权重应约 0.349，这里取 0.35。
+    const 字母 = estimateTokensAccurate('a'.repeat(1000));
+    const 标点 = estimateTokensAccurate('{'.repeat(1000));
+    assert.ok(标点 > 字母 * 1.3, `标点 ${标点} 应显著高于字母 ${字母}`);
+  });
+
+  test('数字比字母贵、比标点便宜', () => {
+    const 字母 = estimateTokensAccurate('a'.repeat(1000));
+    const 数字 = estimateTokensAccurate('7'.repeat(1000));
+    const 标点 = estimateTokensAccurate('{'.repeat(1000));
+    assert.ok(数字 > 字母 && 数字 < 标点);
+  });
+
+  test('空白与换行仍按字母档（不把缩进算贵）', () => {
+    assert.equal(estimateTokensAccurate(' '.repeat(1000)), estimateTokensAccurate('a'.repeat(1000)));
+  });
+});

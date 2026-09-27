@@ -2,7 +2,7 @@
 // 这些是协议转换的核心，历史上出过多种边界问题。
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
-import { prepareBody, classifyFrame, aggregateFrames, upstreamErrorMessage, newId } from '../src/upstream.mjs';
+import { prepareBody, classifyFrame, aggregateFrames, upstreamErrorMessage, newId, applyContextFit } from '../src/upstream.mjs';
 
 const cfg = (over = {}) => ({
   defaultSystemPrompt: 'You are a helpful AI assistant.',
@@ -425,5 +425,58 @@ describe('newId：ID 生成', () => {
   test('大量生成不重复', () => {
     const set = new Set(Array.from({ length: 2000 }, () => newId()));
     assert.equal(set.size, 2000, 'ID 必须唯一');
+  });
+});
+
+// 工具定义（tools / functions）同样占用上游上下文，而且 agent 客户端带进来的那坨
+// 往往比对话本身还大。原先预算只按 messages 算，于是「messages 装得下」被当成
+// 「整个请求装得下」：预压缩不动作 → 上游 400 Invalid request parameters，
+// 而重试反复压 messages 也没用 —— 大头根本不在 messages 里（实测压到 5.8 万仍失败）。
+describe('applyContextFit：工具定义必须计入预算', () => {
+  const 长消息 = (n) => [{ role: 'system', content: 'sys' }, { role: 'user', content: '啊'.repeat(n) }];
+  const 造工具 = (n) =>
+    Array.from({ length: n }, (_, i) => ({
+      type: 'function',
+      function: {
+        name: `demo_tool_${i}`,
+        description: `A demonstration tool number ${i} used to pad the request body.`,
+        parameters: { type: 'object', properties: { p: { type: 'string' } }, required: ['p'] },
+      },
+    }));
+
+  test('tools 占用预算后，messages 会被压得更小', () => {
+    const 无工具 = { model: 'm', messages: 长消息(200000) };
+    const 有工具 = { model: 'm', messages: 长消息(200000), tools: 造工具(400) };
+
+    const a = applyContextFit({ context: {} }, 无工具, { limitOverride: 50000 });
+    const b = applyContextFit({ context: {} }, 有工具, { limitOverride: 50000 });
+
+    assert.ok(a, '无工具时也应触发压缩');
+    assert.ok(b, '有工具时也应触发压缩');
+    assert.ok(b.sideTokens > 0, '应报告工具占用的 token');
+    assert.ok(b.after < a.after, `带工具时 messages 应压得更狠：${b.after} 应小于 ${a.after}`);
+  });
+
+  test('tools 自己就吃满上限时跳过预压缩，不动 messages', () => {
+    // 这时把 messages 截到极小只会把整段对话弄没；交给重试按比例收缩能留住更多上下文
+    const body = { model: 'm', messages: 长消息(200000), tools: 造工具(500) };
+    const 原messages = JSON.parse(JSON.stringify(body.messages));
+    const stats = applyContextFit({ context: {} }, body, { limitOverride: 20000 });
+    assert.equal(stats, null);
+    assert.deepEqual(body.messages, 原messages, '应原样返回，不做截断');
+  });
+
+  test('没有 tools 时行为不变', () => {
+    const body = { model: 'm', messages: 长消息(200000) };
+    const stats = applyContextFit({ context: {} }, body, { limitOverride: 50000 });
+    assert.ok(stats);
+    assert.equal(stats.sideTokens, 0);
+  });
+
+  test('tools 为空数组与缺省等价', () => {
+    const body = { model: 'm', messages: 长消息(200000), tools: [] };
+    const stats = applyContextFit({ context: {} }, body, { limitOverride: 50000 });
+    assert.ok(stats);
+    assert.equal(stats.sideTokens, 0);
   });
 });

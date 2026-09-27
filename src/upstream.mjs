@@ -8,6 +8,7 @@ import { markSuccess, markFailure, isQuotaError, usableCount } from './pool.mjs'
 import {
   fitMessages,
   estimateMessages,
+  estimateTokensAccurate,
   learnedLimit,
   isTooLongError,
   isProviderParamRejection,
@@ -118,6 +119,23 @@ export function prepareBody(cfg, src) {
  *
  * 返回裁剪统计；没裁返回 null。
  */
+/**
+ * 估算请求体里「除 messages 之外、但同样占用上游上下文」的部分。
+ *
+ * 为什么必须算：agent 客户端（DSH / Codex 等）会在 body 里带一大坨工具定义，
+ * 那部分同样计入上游的 prompt。原先只估 messages，于是出现
+ * 「本地估算 454,711、真值远超上限」的偏差 —— 预压缩以为装得下、发出去吃 400，
+ * 而重试只会反复压 messages（实测 454711 → 229754 → 116101 → 58682）
+ * 却怎么都压不下去，因为大头根本不在 messages 里。
+ */
+function estimateSideTokens(body) {
+  const parts = [];
+  if (Array.isArray(body?.tools) && body.tools.length) parts.push(body.tools);
+  if (Array.isArray(body?.functions) && body.functions.length) parts.push(body.functions);
+  if (body?.tool_choice !== undefined) parts.push(body.tool_choice);
+  return parts.length ? estimateTokensAccurate(parts) : 0;
+}
+
 export function applyContextFit(cfg, body, { site = null, limitOverride = null } = {}) {
   const conf = cfg.context || {};
   if (conf.enabled === false) return null;
@@ -127,19 +145,41 @@ export function applyContextFit(cfg, body, { site = null, limitOverride = null }
   const limit = limitOverride || (site ? learnedLimit(site, model) : null);
   if (!Number.isFinite(limit) || limit <= 0) return null; // 不知道上限就先原样发，撞墙后再学
 
-  // 预算拿的是**本地估算值**，而估算器对混合长文本会低估（实测差 1.92 倍）。
+  // 预算拿的是**本地估算值**，而估算器对长文本可能偏低。
   // 把上限按实测倍率折回去，才能让「估算 ≤ 折算上限」等价于「真实 ≤ 上限」，
   // 否则预压缩看着压够了、发出去照样超限，每个请求先白撞一次 400。
   const 折算上限 = site ? Math.floor(limit / calibrationFactor(site, model)) : limit;
 
+  // 工具定义同样占上下文，而且往往很大。裁剪只能动 messages、压不动工具，
+  // 所以必须先把工具的份额扣掉 —— 否则「messages 装得下」根本不等于「整个请求装得下」。
+  const 安全比 = conf.safetyRatio ?? 0.95;
+  const 附属 = estimateSideTokens(body);
+  // 安全余量必须覆盖**整个请求**，而 fitMessages 只会对 messages 那一份打折，
+  // 工具那部分得在这里自己留出来。否则工具占大头时总余量薄得几乎没有：
+  // 实测消息 114,790 + 工具 928,990 在估算口径下刚好卡进上限，真值却超了，
+  // 于是白多打两轮、白等 25 秒。
+  const 消息预算 = (附属 ? Math.floor(折算上限 * 安全比) : 折算上限) - 附属;
+  if (消息预算 <= 0) {
+    // 工具定义已经吃满全部预算（连安全余量都不剩）。这时预压缩只会把 messages
+    // 截到极小、把整段对话弄没，还不如直接发出去，让下面「按比例收缩」的重试
+    // 去试探真实边界 —— 它不做安全余量扣除，能留住的上下文更多。
+    warn(
+      `[${site}] ${model} 的工具定义约 ${附属} tokens，已吃满上下文上限 ${limit}，`
+      + `预压缩跳过（改由重试按比例收缩试探；若持续失败请精简客户端的工具 / MCP 数量）`,
+    );
+    return null;
+  }
+
   const { messages, stats } = fitMessages(body.messages, {
-    maxInputTokens: 折算上限,
+    maxInputTokens: 消息预算,
     reserveForOutput: Number(body.max_tokens) || conf.reserveForOutput || 4096,
     minKeepMessages: conf.minKeepMessages ?? 4,
-    safetyRatio: conf.safetyRatio ?? 0.95,
+    safetyRatio: 安全比,
   });
   body.messages = messages;
-  return stats.applied ? stats : null;
+  if (!stats.applied) return null;
+  stats.sideTokens = 附属;
+  return stats;
 }
 
 function normalizeToolChoice(body) {
@@ -197,7 +237,9 @@ export async function openChat(cfg, site, body, { signal, exclude = [], accountI
   if (fit) {
     warn(
       `[${site}] ${model} 上下文超限，已自动压缩：丢弃 ${fit.dropped} 条、截断 ${fit.truncated} 条，`
-      + `${fit.before} → ${fit.after} tokens（上限 ${fit.limit}）`,
+      + `${fit.before} → ${fit.after} tokens（上限 ${fit.limit}`
+      + (fit.sideTokens ? `，另扣掉不参与裁剪的工具定义 ${fit.sideTokens} tokens` : '')
+      + '）',
     );
   }
 
@@ -265,15 +307,23 @@ export async function openChat(cfg, site, body, { signal, exclude = [], accountI
     // 只在「输入太长」且还有机会压缩时重试
     if (res.status < 400 || 压缩重试次数 >= 最大压缩重试) break;
     const text = await res.text().catch(() => '');
-    // 这两个值要在判断之前算出来：下面判断 11133 算不算「超限」时要用到。
     const 已知上限 = learnedLimit(site, model);
-    const 当前估计 = estimateMessages(当前payload.messages);
+    // 工具定义不参与裁剪，但**要算进体积**：否则「messages 装得下」会被误当成
+    // 「整个请求装得下」，预压缩不动作、发出去吃 400，而重试怎么压 messages 都没用。
+    const 附属 = estimateSideTokens(当前payload);
+    const 消息估计 = estimateMessages(当前payload.messages);
+    const 当前估计 = 消息估计 + 附属;
     // 供应商侧把「输入远超上限」也报成 400 + 11133 model_param_invalid（没有 token 数字），
     // 任何「too long」关键词都匹配不到，压缩逻辑完全不触发 —— 请求硬失败。
-    // 这个码同样可能来自「别的参数非法」，所以加一道守卫：
-    // 只有在「已知上限无法证明当前体积合规」时才把它当超限处理。
-    const 可能是超限 =
-      isProviderParamRejection(text) && (已知上限 === null || 当前估计 * calibrationFactor(site, model) > 已知上限);
+    //
+    // 这里**不能**用本地估算去排除超限的可能：本地估算恰恰就是会低估的那个东西
+    // （实测真实 1,193,121 / 本地估 620,249，差 1.92 倍）。曾经想过「已知上限能证明
+    // 体积合规时就不当超限」——那是自相矛盾的：预压缩正是因为信了这个偏低的估算才没压，
+    // 再用它去排除超限，就变成「体积没问题，一定是参数问题」，于是拒绝压缩、硬失败。
+    //
+    // 所以只要没有 token 数字，一律按超限处理。代价可控：真要是别的参数非法，
+    // 压缩后重试仍会失败，最终照样把上游的原始错误如实抛给客户端。
+    const 可能是超限 = isProviderParamRejection(text);
     if (!isTooLongError(res.status, text) && !可能是超限) {
       // 不是「太长」，把读掉的 body 还原成一个可返回的结果
       res = { status: res.status, _text: text };
@@ -291,11 +341,23 @@ export async function openChat(cfg, site, body, { signal, exclude = [], accountI
     //   真正触发 400 的是请求体积（约 34~40 万字符），报错信息是误导性的。
     //   所以这里不把它当成模型的真实上限，只当「这次发太大了」的信号，
     //   用「相对收缩 + 重试」逐步逼近，而不是一步跳到那个数字。
-    const 收缩比 = 压缩重试次数 === 0 ? 0.75 : 0.5;
-    // 已知上限比当前还小时直接按它压，否则按比例收缩；上限同样要按校准倍率折算
+    // 没有 token 数字（11133）说明我们对体积的估计本来就不可信，第一次就压得更狠一些，
+    // 免得 0.75 压完仍然超限、白多打一轮（每轮都要等上游 5~20 秒）。
+    const 收缩比 = 压缩重试次数 === 0 ? (真实tokens === null ? 0.5 : 0.75) : 0.5;
+    // 上限先扣掉「压不动的工具定义」，剩下的才是 messages 的可用额度；
+    // 收缩比也只作用于 messages（工具定义不参与裁剪，不能跟着一起缩）。
     const 折算上限 =
-      已知上限 === null ? Number.POSITIVE_INFINITY : Math.floor(已知上限 / calibrationFactor(site, model));
-    const 预算 = Math.min(折算上限, Math.floor(当前估计 * 收缩比));
+      已知上限 === null
+        ? Number.POSITIVE_INFINITY
+        : Math.floor(已知上限 / calibrationFactor(site, model)) - 附属;
+    const 预算 = Math.min(折算上限, Math.floor(消息估计 * 收缩比));
+    if (!(预算 > 0)) {
+      warn(
+        `[${site}] ${model} 的工具定义约 ${附属} tokens，已占满上下文上限 ${已知上限}，`
+        + `压缩 messages 无法解决（请精简客户端启用的工具 / MCP 数量）`,
+      );
+      break;
+    }
 
     const 更小 = fitMessages(Array.isArray(当前payload.messages) ? 当前payload.messages : [], {
       maxInputTokens: 预算,
@@ -309,7 +371,9 @@ export async function openChat(cfg, site, body, { signal, exclude = [], accountI
     warn(
       `[${site}] ${model} 输入超限（${text.slice(0, 100).replace(/\s+/g, ' ')}），`
       + `已压缩上下文后重试（丢弃 ${更小.stats.dropped} 条，截断 ${更小.stats.truncated} 条，`
-      + `${更小.stats.before} → ${更小.stats.after} tokens，目标 ${预算}）`,
+      + `${更小.stats.before} → ${更小.stats.after} tokens，目标 ${预算}`
+      + (附属 ? `；另有工具定义约 ${附属} tokens 不参与裁剪` : '')
+      + '）',
     );
     res = undefined;
   }

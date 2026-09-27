@@ -32,14 +32,25 @@ function tokenWeight(text) {
   const s = String(text);
   let cjk = 0;
   let digit = 0;
-  let other = 0;
+  let punct = 0;
+  let word = 0;
   for (const ch of s) {
-    if (CJK.test(ch)) cjk++;
-    else if (ch >= '0' && ch <= '9') digit++;
-    else other++;
+    if (CJK.test(ch)) {
+      cjk++;
+      continue;
+    }
+    const c = ch.charCodeAt(0);
+    if (c >= 48 && c <= 57) digit++;
+    // 字母与空白：分词器会把连续的字母串合成较少的 token
+    else if ((c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c === 32 || (c >= 9 && c <= 13)) word++;
+    // 其余（标点 / 符号 / 其他 Unicode）：分词器基本一个字符一个 token，权重明显更高
+    else punct++;
   }
-  // 数字与标点/符号被分词器切得更碎，权重高于英文字母
-  return cjk * 0.55 + digit * 0.33 + other * 0.25;
+  // 标点权重 0.35 是实测反推的，不是拍脑袋：一个 360 万字符的 tools JSON
+  // （字母/空白 70%、标点 19.6%、数字 10.4%）本地估算 928,990，上游真实约 998,920，
+  // 低估 7.5%。按上面这个构成解方程，标点权重需要 0.349 —— 原来一律按 0.25 算，
+  // 恰恰把 JSON / 代码里最贵的部分估便宜了。
+  return cjk * 0.55 + digit * 0.33 + word * 0.25 + punct * 0.35;
 }
 
 /**
